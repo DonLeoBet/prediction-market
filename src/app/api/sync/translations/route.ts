@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, like, lte, or } from 'drizzle-orm'
+import { and, asc, eq, inArray, isNull, like, lte, or } from 'drizzle-orm'
 import { createHash } from 'node:crypto'
 
 import type { NonDefaultLocale } from '@/i18n/locales'
@@ -29,7 +29,10 @@ export const maxDuration = 60
 
 const SYNC_TIME_LIMIT_MS = 55_000
 const JOB_BATCH_SIZE = 120
-const TRANSLATION_LOCALE_CONCURRENCY = 3
+const TRANSLATION_LOCALE_CONCURRENCY = 11
+const OPENROUTER_TRANSLATION_TIMEOUT_MS = 35_000
+const TRANSLATION_COMPLETION_BUFFER_MS = 5_000
+const PROCESSING_LEASE_STALE_MS = 10 * 60 * 1000
 const DEFAULT_MAX_ATTEMPTS = 2
 const EVENT_TITLE_TRANSLATION_JOB_TYPE = 'translate_event_title'
 const TAG_NAME_TRANSLATION_JOB_TYPE = 'translate_tag_name'
@@ -84,6 +87,7 @@ interface TranslationJobStats {
   completed: number
   retried: number
   failed: number
+  recoveredStale: number
   skippedManual: number
   skippedResolved: number
   skippedUpToDate: number
@@ -272,6 +276,51 @@ async function fetchCandidateJobs(nowIso: string, locales: NonDefaultLocale[]): 
     .limit(JOB_BATCH_SIZE)
 
   return rows as TranslationJobRow[]
+}
+
+async function recoverStaleProcessingJobs(now: Date) {
+  const staleThreshold = new Date(now.getTime() - PROCESSING_LEASE_STALE_MS)
+  const recoveredRows = await db
+    .update(jobsTable)
+    .set({
+      status: 'pending',
+      available_at: now,
+      reserved_at: null,
+      last_error: 'Recovered stale translation processing lease.',
+    })
+    .where(
+      and(
+        inArray(jobsTable.job_type, [...TRANSLATION_JOB_TYPES]),
+        eq(jobsTable.status, 'processing'),
+        or(isNull(jobsTable.reserved_at), lte(jobsTable.reserved_at, staleThreshold)),
+      ),
+    )
+    .returning({ id: jobsTable.id })
+
+  return recoveredRows.length
+}
+
+async function releaseClaimedJobs(jobs: TranslationJobRow[]) {
+  if (jobs.length === 0) {
+    return
+  }
+
+  await db
+    .update(jobsTable)
+    .set({
+      status: 'pending',
+      available_at: new Date(),
+      reserved_at: null,
+    })
+    .where(
+      and(
+        inArray(
+          jobsTable.id,
+          jobs.map((job) => job.id),
+        ),
+        eq(jobsTable.status, 'processing'),
+      ),
+    )
 }
 
 async function claimJob(job: TranslationJobRow, nowIso: string): Promise<TranslationJobRow | null> {
@@ -645,6 +694,7 @@ async function translateBatchText(rows: TranslationBatchInputRow[], model?: stri
       model,
       temperature: 0,
       maxTokens: Math.min(4_000, Math.max(250, providerRows.length * 120)),
+      timeoutMs: OPENROUTER_TRANSLATION_TIMEOUT_MS,
     },
   )
 
@@ -752,10 +802,20 @@ async function processPendingTranslationJobs(
   model: string | undefined,
   apiKey: string | undefined,
   stats: TranslationJobStats,
+  startedAtMs: number,
 ) {
   const localeBatches = groupTranslationsByLocale(pendingJobs)
 
   for (let index = 0; index < localeBatches.length; index += TRANSLATION_LOCALE_CONCURRENCY) {
+    const elapsedMs = Date.now() - startedAtMs
+    const requiredBudgetMs = OPENROUTER_TRANSLATION_TIMEOUT_MS + TRANSLATION_COMPLETION_BUFFER_MS
+    if (elapsedMs >= SYNC_TIME_LIMIT_MS - requiredBudgetMs) {
+      const unprocessedJobs = localeBatches.slice(index).flat()
+      await releaseClaimedJobs(unprocessedJobs.map((job) => job.claimed))
+      stats.timeLimitReached = true
+      break
+    }
+
     await Promise.all(
       localeBatches
         .slice(index, index + TRANSLATION_LOCALE_CONCURRENCY)
@@ -768,6 +828,7 @@ async function preparePendingTranslationJobs(
   claimedJobs: ClaimedTranslationJob[],
   providerSignature: string,
   stats: TranslationJobStats,
+  startedAtMs: number,
 ) {
   const pendingJobs: PendingTranslationJob[] = []
   if (claimedJobs.length === 0) {
@@ -790,7 +851,14 @@ async function preparePendingTranslationJobs(
     ),
   ])
 
-  for (const claimedJob of claimedJobs) {
+  for (let index = 0; index < claimedJobs.length; index += 1) {
+    if (isTimeLimitReached(startedAtMs)) {
+      await releaseClaimedJobs(claimedJobs.slice(index).map((job) => job.claimed))
+      stats.timeLimitReached = true
+      break
+    }
+
+    const claimedJob = claimedJobs[index]!
     try {
       if (claimedJob.kind === EVENT_TITLE_TRANSLATION_JOB_TYPE) {
         const eventSource = eventSourceMap.get(claimedJob.payload.event_id)
@@ -892,6 +960,7 @@ export async function GET(request: Request) {
     completed: 0,
     retried: 0,
     failed: 0,
+    recoveredStale: 0,
     skippedManual: 0,
     skippedResolved: 0,
     skippedUpToDate: 0,
@@ -940,7 +1009,9 @@ export async function GET(request: Request) {
 
       const startedAt = Date.now()
 
-      const nowIso = new Date().toISOString()
+      const now = new Date()
+      stats.recoveredStale = await recoverStaleProcessingJobs(now)
+      const nowIso = now.toISOString()
       const candidates = await fetchCandidateJobs(nowIso, enabledTranslationLocales)
       const claimedJobs: ClaimedTranslationJob[] = []
 
@@ -1011,12 +1082,18 @@ export async function GET(request: Request) {
       }
 
       try {
-        const pendingTranslations = await preparePendingTranslationJobs(claimedJobs, providerSignature, stats)
+        const pendingTranslations = await preparePendingTranslationJobs(
+          claimedJobs,
+          providerSignature,
+          stats,
+          startedAt,
+        )
         await processPendingTranslationJobs(
           pendingTranslations,
           openRouterSettings.model,
           openRouterSettings.apiKey,
           stats,
+          startedAt,
         )
       } catch (error) {
         for (const claimedJob of claimedJobs) {

@@ -183,7 +183,7 @@ export function resolveDeterministicTranslation(input: {
     }
 
     const localizedDate = formatLocalizedDate(input.locale, startDate, Boolean(year))
-    const localizedTime = `${formatLocalizedTime(input.locale, startDate)}-${formatLocalizedTime(input.locale, endDate)}`
+    const localizedTime = `${formatLocalizedTime(input.locale, startDate)}–${formatLocalizedTime(input.locale, endDate)}`
     return formatTimedUpOrDownTitle(input.locale, subject.trim(), localizedDate, localizedTime)
   }
 

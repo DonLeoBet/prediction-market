@@ -130,8 +130,8 @@ describe('translation batch safety', () => {
   })
 
   it.each([
-    ['pt', 'Bitcoin sobe ou desce — 2 de agosto, 16:00-20:00 ET'],
-    ['de', 'Bitcoin rauf oder runter — 2. August, 20:00-0:00 ET'],
+    ['pt', 'Bitcoin sobe ou desce — 2 de agosto, 16:00–20:00 ET'],
+    ['de', 'Bitcoin rauf oder runter — 2. August, 20:00–0:00 ET'],
   ] as const)('formats ranged %s up-or-down titles deterministically', (locale, expected) => {
     const sourceText =
       locale === 'de'
