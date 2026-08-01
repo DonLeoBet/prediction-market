@@ -28,7 +28,7 @@ import { isNonDefaultLocale, parseEventJobPayload, parseTagJobPayload } from '@/
 export const maxDuration = 60
 
 const SYNC_TIME_LIMIT_MS = 55_000
-const JOB_BATCH_SIZE = 24
+const JOB_BATCH_SIZE = 120
 const TRANSLATION_LOCALE_CONCURRENCY = 3
 const DEFAULT_MAX_ATTEMPTS = 2
 const EVENT_TITLE_TRANSLATION_JOB_TYPE = 'translate_event_title'

@@ -129,6 +129,24 @@ describe('translation batch safety', () => {
     ).toBe(expected)
   })
 
+  it.each([
+    ['pt', 'Bitcoin sobe ou desce — 2 de agosto, 16:00-20:00 ET'],
+    ['de', 'Bitcoin rauf oder runter — 2. August, 20:00-0:00 ET'],
+  ] as const)('formats ranged %s up-or-down titles deterministically', (locale, expected) => {
+    const sourceText =
+      locale === 'de'
+        ? 'Bitcoin Up or Down - August 2, 8:00PM-12:00AM ET'
+        : 'Bitcoin Up or Down - August 2, 4:00PM-8:00PM ET'
+
+    expect(
+      resolveDeterministicTranslation({
+        locale,
+        sourceLabel: 'event title',
+        sourceText,
+      }),
+    ).toBe(expected)
+  })
+
   it('versions deterministic titles so existing automatic translations are refreshed', () => {
     expect(
       resolveDeterministicTranslationVersion({
@@ -158,6 +176,13 @@ describe('translation batch safety', () => {
         sourceText: 'Trump approval Up or Down this week?',
       }),
     ).toBe('Trump approval Up or Down this week?\0up-or-down-weekly-v1')
+    expect(
+      resolveTranslationSourceFingerprint({
+        locale: 'pt',
+        sourceLabel: 'event title',
+        sourceText: 'Bitcoin Up or Down - August 2, 4:00PM-8:00PM ET',
+      }),
+    ).toBe('Bitcoin Up or Down - August 2, 4:00PM-8:00PM ET\0up-or-down-range-v1')
   })
 
   it('leaves other title patterns and tag names to the provider', () => {
