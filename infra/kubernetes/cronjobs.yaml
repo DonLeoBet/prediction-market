@@ -132,7 +132,7 @@ metadata:
   name: kuest-sync-translations-enqueue
   namespace: kuest
 spec:
-  schedule: '17 * * * *'
+  schedule: '3,12,21,30,39,48,57 * * * *'
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
@@ -164,7 +164,7 @@ metadata:
   name: kuest-sync-translations
   namespace: kuest
 spec:
-  schedule: '18 * * * *'
+  schedule: '4,13,22,31,40,49,58 * * * *'
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
