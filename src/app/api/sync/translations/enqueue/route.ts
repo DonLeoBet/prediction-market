@@ -21,6 +21,8 @@ import { isNonDefaultLocale, parseEventJobPayload, parseTagJobPayload } from '@/
 export const maxDuration = 30
 
 const ENQUEUE_TIME_LIMIT_MS = 20_000
+const DETERMINISTIC_TIME_LIMIT_MS = 8_000
+const DETERMINISTIC_SCAN_ROW_LIMIT = 500
 const DISCOVERY_SCAN_PAGE_SIZE = 100
 const DISCOVERY_ENQUEUE_TARGET = 120
 const JOB_UPSERT_BATCH_SIZE = 100
@@ -216,6 +218,10 @@ function buildSourceHash(value: string) {
 
 function isTimeLimitReached(startedAtMs: number) {
   return Date.now() - startedAtMs >= ENQUEUE_TIME_LIMIT_MS
+}
+
+function isDeterministicLimitReached(startedAtMs: number, scannedRows: number) {
+  return Date.now() - startedAtMs >= DETERMINISTIC_TIME_LIMIT_MS || scannedRows >= DETERMINISTIC_SCAN_ROW_LIMIT
 }
 
 function buildProviderSignature(model: string | undefined) {
@@ -423,7 +429,7 @@ async function syncDeterministicEventTranslations(startedAtMs: number, locales: 
   let completed = 0
   let offset = 0
 
-  while (!isTimeLimitReached(startedAtMs)) {
+  while (!isDeterministicLimitReached(startedAtMs, offset)) {
     const page = await loadEventSourcePage(offset)
     if (page.rawCount === 0) {
       break

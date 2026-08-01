@@ -31,6 +31,7 @@ const SYNC_TIME_LIMIT_MS = 55_000
 const JOB_BATCH_SIZE = 120
 const TRANSLATION_LOCALE_CONCURRENCY = 11
 const OPENROUTER_TRANSLATION_TIMEOUT_MS = 35_000
+const MIN_OPENROUTER_TRANSLATION_TIMEOUT_MS = 5_000
 const TRANSLATION_COMPLETION_BUFFER_MS = 5_000
 const PROCESSING_LEASE_STALE_MS = 10 * 60 * 1000
 const DEFAULT_MAX_ATTEMPTS = 2
@@ -85,6 +86,7 @@ interface TagTranslationMetaRow {
 interface TranslationJobStats {
   scanned: number
   completed: number
+  deferred: number
   retried: number
   failed: number
   recoveredStale: number
@@ -302,10 +304,10 @@ async function recoverStaleProcessingJobs(now: Date) {
 
 async function releaseClaimedJobs(jobs: TranslationJobRow[]) {
   if (jobs.length === 0) {
-    return
+    return 0
   }
 
-  await db
+  const releasedRows = await db
     .update(jobsTable)
     .set({
       status: 'pending',
@@ -321,6 +323,9 @@ async function releaseClaimedJobs(jobs: TranslationJobRow[]) {
         eq(jobsTable.status, 'processing'),
       ),
     )
+    .returning({ id: jobsTable.id })
+
+  return releasedRows.length
 }
 
 async function claimJob(job: TranslationJobRow, nowIso: string): Promise<TranslationJobRow | null> {
@@ -621,7 +626,12 @@ function parseBatchTranslationResponse(raw: string, expectedRows: TranslationBat
   return result
 }
 
-async function translateBatchText(rows: TranslationBatchInputRow[], model?: string, apiKey?: string) {
+async function translateBatchText(
+  rows: TranslationBatchInputRow[],
+  model?: string,
+  apiKey?: string,
+  timeoutMs = OPENROUTER_TRANSLATION_TIMEOUT_MS,
+) {
   if (rows.length === 0) {
     return new Map<string, string>()
   }
@@ -694,7 +704,7 @@ async function translateBatchText(rows: TranslationBatchInputRow[], model?: stri
       model,
       temperature: 0,
       maxTokens: Math.min(4_000, Math.max(250, providerRows.length * 120)),
-      timeoutMs: OPENROUTER_TRANSLATION_TIMEOUT_MS,
+      timeoutMs,
     },
   )
 
@@ -745,6 +755,7 @@ async function processPendingLocaleTranslationJobs(
   model: string | undefined,
   apiKey: string | undefined,
   stats: TranslationJobStats,
+  timeoutMs: number,
 ) {
   if (pendingJobs.length === 0) {
     return
@@ -760,7 +771,7 @@ async function processPendingLocaleTranslationJobs(
   let translatedById: Map<string, string>
 
   try {
-    translatedById = await translateBatchText(batchRows, model, apiKey)
+    translatedById = await translateBatchText(batchRows, model, apiKey, timeoutMs)
   } catch (error) {
     for (const pendingJob of pendingJobs) {
       await retryClaimedJob(pendingJob.claimed, pendingJob.identity, error, stats)
@@ -808,18 +819,19 @@ async function processPendingTranslationJobs(
 
   for (let index = 0; index < localeBatches.length; index += TRANSLATION_LOCALE_CONCURRENCY) {
     const elapsedMs = Date.now() - startedAtMs
-    const requiredBudgetMs = OPENROUTER_TRANSLATION_TIMEOUT_MS + TRANSLATION_COMPLETION_BUFFER_MS
-    if (elapsedMs >= SYNC_TIME_LIMIT_MS - requiredBudgetMs) {
+    const availableRequestMs = SYNC_TIME_LIMIT_MS - elapsedMs - TRANSLATION_COMPLETION_BUFFER_MS
+    if (availableRequestMs < MIN_OPENROUTER_TRANSLATION_TIMEOUT_MS) {
       const unprocessedJobs = localeBatches.slice(index).flat()
-      await releaseClaimedJobs(unprocessedJobs.map((job) => job.claimed))
+      stats.deferred += await releaseClaimedJobs(unprocessedJobs.map((job) => job.claimed))
       stats.timeLimitReached = true
       break
     }
 
+    const timeoutMs = Math.min(OPENROUTER_TRANSLATION_TIMEOUT_MS, availableRequestMs)
     await Promise.all(
       localeBatches
         .slice(index, index + TRANSLATION_LOCALE_CONCURRENCY)
-        .map((localeBatch) => processPendingLocaleTranslationJobs(localeBatch, model, apiKey, stats)),
+        .map((localeBatch) => processPendingLocaleTranslationJobs(localeBatch, model, apiKey, stats, timeoutMs)),
     )
   }
 }
@@ -853,7 +865,7 @@ async function preparePendingTranslationJobs(
 
   for (let index = 0; index < claimedJobs.length; index += 1) {
     if (isTimeLimitReached(startedAtMs)) {
-      await releaseClaimedJobs(claimedJobs.slice(index).map((job) => job.claimed))
+      stats.deferred += await releaseClaimedJobs(claimedJobs.slice(index).map((job) => job.claimed))
       stats.timeLimitReached = true
       break
     }
@@ -958,6 +970,7 @@ export async function GET(request: Request) {
   const stats: TranslationJobStats = {
     scanned: 0,
     completed: 0,
+    deferred: 0,
     retried: 0,
     failed: 0,
     recoveredStale: 0,
